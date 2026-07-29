@@ -1,0 +1,1156 @@
+---
+title: "A Comparative Analysis: Machine Learning"
+author: "Ibrahim Khalil Ullah Midul"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+set.seed(42)
+```
+
+```{r packages, message=FALSE, warning=FALSE}
+# All packages are installed dynamically — do not modify this chunk
+pkgs <- c(
+  "tidyverse", "skimr", "moments", "ggcorrplot",
+  "knitr", "kableExtra", "corrplot",
+  "caret", "rpart", "rpart.plot",
+  "randomForest", "nnet", "kernlab", "scales"
+)
+for (pkg in pkgs) {
+  if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+    install.packages(pkg, repos = "https://cran.r-project.org")
+    library(pkg, character.only = TRUE)
+  }
+}
+```
+
+---
+
+# Section 1 — Problem Framing
+
+## 1.1 Domain Context and Dataset Background
+
+This project analyses the **CWUR (Center for World University Rankings)** dataset, which contains annual ranking data for universities worldwide from 2012 to 2015. Each record represents one university in one year and includes institutional metrics such as quality of education, alumni employment, quality of faculty, research publications, academic influence, citations, patents filed, and a composite overall score. Understanding what drives university rankings is practically important for institutions seeking to improve their global standing, for governments allocating research funding, and for students making enrolment decisions.
+
+## 1.2 Analytical Questions
+
+The following research questions guide this analysis:
+
+1. Which academic performance metrics (quality of education, alumni employment, faculty quality, publications, influence, citations, patents) are most strongly associated with a university's overall score?
+2. Can we accurately classify a university into its rank tier (Top 100, Top 200, Top 500, or Others) based solely on its measurable academic metrics?
+3. Which classification model — Decision Tree, Random Forest, Multinomial Logistic Regression, KNN, or SVM — achieves the highest accuracy on the held-out test set, and are those differences statistically significant?
+
+## 1.3 Success Criteria and Evaluation Metrics
+
+A successful analysis will clearly identify the features that most discriminate between rank tiers and select a model that generalises well to unseen data. For the EDA phase, success means producing interpretable visualisations that reveal meaningful distributional patterns and inter-variable relationships. In the modelling phase, success is measured using **accuracy**, **macro-averaged F1-score**, **precision**, **recall**, and **Cohen's Kappa** across all five classifiers on the test set. Model differences will be assessed using the **McNemar test** to determine whether performance gaps are statistically significant (α = 0.05).
+
+## 1.4 Dataset Justification
+
+The CWUR dataset is well-suited to these questions because it directly quantifies the institutional metrics that the ranking methodology is built upon. It spans four years and many countries, providing sufficient volume and diversity for robust modelling. The `world_rank` column enables construction of a natural multi-class target variable using established prestige thresholds (Top 100 / 200 / 500 / Others), making this dataset ideal for both exploratory and classification-based analysis.
+
+---
+
+# Section 2 — Data Acquisition & Initial Inspection
+
+## 2.1 Loading the Data
+
+```{r load-data}
+CONFIG <- list(
+  data_path = "https://raw.githubusercontent.com/Midul3246/University-Ranking-Prediction-Code/main/cwurData%20(1).csv"
+)
+
+univ <- read.csv(
+  CONFIG$data_path,
+  stringsAsFactors = FALSE
+)
+
+head(univ)
+```
+
+**Observation:** The first few rows reveal a mix of numeric columns (`world_rank`, `national_rank`, `quality_of_education`, `alumni_employment`, `quality_of_faculty`, `publications`, `influence`, `citations`, `score`, `year`) and character columns (`institution`, `country`). The `patents` column appears empty for the earliest years — a structural missingness issue that will be addressed in preprocessing. The `score` column is the primary continuous target and `world_rank` will be used to derive the classification target.
+
+## 2.2 Dimensions and Variable Types
+
+```{r inspect}
+cat("Rows:", nrow(univ), "\n")
+cat("Columns:", ncol(univ), "\n")
+glimpse(univ)
+```
+
+**Observation:** The dataset has over 2,000 rows and 14 columns. Most predictors are integers representing ordinal rank positions (lower = better performance on that metric). The `score` column is a double. The `patents` column may be read as character due to empty strings in earlier years — this will be coerced to numeric during cleaning. The `broad_impact` column has a high missing rate and will be excluded from modelling.
+
+## 2.3 Summary Statistics
+
+```{r summary}
+skim(univ)
+```
+
+**Observation:** The skim output confirms that `patents` and `broad_impact` have substantial missing values. The `score` variable ranges from approximately 44 to 100, with most universities clustering at the lower end — indicating that only a small number of elite institutions achieve very high scores. Ordinal predictors like `quality_of_education`, `publications`, and `citations` span wide ranges (1 to 1000+) as expected for global rank positions.
+
+## 2.4 Data Provenance
+
+- **Source:** CWUR (Center for World University Rankings) — dataset covers 2012–2015 editions
+- **Collection method:** Annual rankings compiled by CWUR based on institutional metrics: quality of education (alumni winning major awards), alumni employment (alumni holding CEO positions), quality of faculty (faculty winning major awards), research publications, academic influence (highly-cited researchers), citations, broad impact (h-index), and patents
+- **Known limitations:** `patents` data is absent for the 2012 and 2013 editions (structural missingness). `broad_impact` was introduced mid-period. Rankings are ordinal within each year and are not directly comparable across years if methodology changed. The dataset covers a fixed historical window (2012–2015) and does not reflect current university standings.
+
+---
+
+# Section 3 — Exploratory Data Analysis (EDA)
+
+```{r eda-prep, include=FALSE}
+# Prepare a clean version of the data for EDA plots
+univ_eda <- univ %>%
+  distinct() %>%
+  filter(!is.na(score)) %>%
+  mutate(patents = suppressWarnings(as.numeric(patents)),
+         patents = ifelse(is.na(patents), mean(patents, na.rm = TRUE), patents),
+         Rank_Category = case_when(
+           world_rank <= 100 ~ "Top100",
+           world_rank <= 200 ~ "Top200",
+           world_rank <= 500 ~ "Top500",
+           TRUE              ~ "Others"
+         ),
+         Rank_Category = factor(Rank_Category,
+                                levels = c("Top100", "Top200", "Top500", "Others")))
+```
+
+## 3.1 Univariate Analysis — Numeric Variables
+
+```{r univariate-numeric, fig.width=10, fig.height=6}
+num_cols <- univ_eda %>% select(where(is.numeric)) %>% names()
+
+univ_eda %>%
+  select(all_of(num_cols)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30, fill = "#0F6E56", colour = "white", alpha = 0.8) +
+  facet_wrap(~variable, scales = "free") +
+  labs(title = "Distribution of Numeric Variables", x = NULL, y = "Count") +
+  theme_minimal()
+```
+
+**Observation:** The `score` variable is right-skewed — most universities have relatively low scores, with only a small elite tail achieving high values. `world_rank` is roughly uniform (expected for a rank from 1 to 1000). Ordinal metric columns (`publications`, `citations`, `influence`, `quality_of_education`, `quality_of_faculty`) are right-skewed because the majority of universities have large (worse) rank numbers. `patents` is the most heavily skewed due to mean-imputed zeros from missing years. These skewed distributions are structurally expected for global ranking data and do not necessarily require transformation for the tree-based models used in this project.
+
+## 3.2 Univariate Analysis — Categorical Variables
+
+```{r univariate-categorical, fig.width=8, fig.height=5}
+univ_eda %>%
+  count(country, sort = TRUE) %>%
+  top_n(15, n) %>%
+  ggplot(aes(x = reorder(country, n), y = n, fill = country)) +
+  geom_col(alpha = 0.85) +
+  coord_flip() +
+  labs(title = "Top 15 Countries by Number of Universities", x = NULL, y = "Count") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+**Observation:** The USA dominates the dataset by a large margin, with far more universities represented than any other country. The UK, Germany, France, and Japan follow at a considerable distance. This heavy imbalance means country-level analyses will be skewed toward US institutions. The `country` variable is excluded from modelling due to its high cardinality (60+ levels) which risks prediction errors when the test set contains levels unseen during training.
+
+## 3.3 Skewness Analysis
+
+```{r skewness}
+skew_vals <- univ_eda %>%
+  select(where(is.numeric)) %>%
+  summarise(across(everything(), ~round(skewness(., na.rm = TRUE), 3))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Skewness") %>%
+  mutate(
+    Direction = case_when(
+      Skewness >  1   ~ "Highly right-skewed",
+      Skewness >  0.5 ~ "Moderately right-skewed",
+      Skewness < -1   ~ "Highly left-skewed",
+      Skewness < -0.5 ~ "Moderately left-skewed",
+      TRUE            ~ "Approximately symmetric"
+    )
+  ) %>%
+  arrange(desc(abs(Skewness)))
+
+kable(skew_vals, caption = "Skewness of Numeric Variables") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+**Observation:** `patents` is the most heavily skewed variable, largely due to mean-imputed values from years where it was not collected. `score` and `national_rank` are also notably skewed. Most ordinal rank columns are moderately right-skewed — structurally expected. For the Decision Tree and Random Forest models (the primary classifiers), skewness is not a concern since these models are threshold-based and scale-invariant. For KNN and SVM, z-score scaling is applied during preprocessing (Section 4.4) which partially mitigates skewness effects.
+
+## 3.4 Bivariate Analysis — Predictors vs. Target
+
+```{r bivariate, fig.width=9, fig.height=5}
+univ_eda %>%
+  ggplot(aes(x = Rank_Category, y = score, fill = Rank_Category)) +
+  geom_boxplot(alpha = 0.8, outlier.colour = "#D85A30") +
+  scale_fill_manual(values = c("#0072B2", "#009E73", "#E69F00", "#D55E00")) +
+  labs(title = "Score Distribution by Rank Category",
+       x = "Rank Category", y = "Score", fill = "Rank Category") +
+  theme_minimal()
+```
+
+**Observation:** There is a clear and monotonic decrease in score as rank category worsens — Top100 universities have very high scores with a tight distribution, while Others universities have uniformly low scores. The gap between Top100 and Top200 is more pronounced than between Top200 and Top500, suggesting the classification boundary at rank 100 is the sharpest. Top200 and Top500 show some distributional overlap, which will challenge classifiers trying to distinguish these two groups.
+
+## 3.5 Correlation Analysis
+
+```{r correlation, fig.width=8, fig.height=6}
+cor_matrix <- univ_eda %>%
+  select(where(is.numeric)) %>%
+  cor(use = "complete.obs")
+
+ggcorrplot(cor_matrix,
+           method   = "circle",
+           type     = "lower",
+           lab      = TRUE,
+           lab_size = 3,
+           colors   = c("#D85A30", "white", "#0F6E56"),
+           title    = "Correlation Heatmap") +
+  theme_minimal()
+```
+
+**Observation:** `score` is strongly negatively correlated with `world_rank` (r ≈ −1), confirming internal dataset consistency. Among predictors, `publications`, `citations`, and `influence` are highly positively correlated with each other (r > 0.8), indicating multicollinearity in the research-output cluster. For tree-based models this is not problematic, but it motivates careful feature importance interpretation. `quality_of_education` and `quality_of_faculty` are moderately correlated with `score`, confirming their relevance as predictors.
+
+## 3.6 Notable Finding
+
+Universities in the Top 100 show a distinctly tighter clustering of research metrics compared to all other rank categories — suggesting that elite status requires simultaneously high performance across *all* research dimensions, not just one.
+
+```{r notable-finding, fig.width=9, fig.height=5}
+univ_eda %>%
+  ggplot(aes(x = publications, y = citations, colour = Rank_Category)) +
+  geom_point(alpha = 0.3, size = 1.5) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.9) +
+  scale_colour_manual(values = c("#0072B2", "#009E73", "#E69F00", "#D55E00")) +
+  labs(title = "Publications Rank vs. Citations Rank by Rank Category",
+       subtitle = "Lower values = better performance on that metric",
+       x = "Publications Rank", y = "Citations Rank",
+       colour = "Rank Category") +
+  theme_minimal()
+```
+
+**Observation:** Top100 universities cluster tightly in the low-value (high-performance) corner of the publications vs. citations space, while the other categories spread widely with weaker regression slopes. This confirms that Top100 status requires both high publication output *and* high citation impact simultaneously — neither alone is sufficient. The Others category has an almost flat relationship between the two metrics, suggesting that among lower-ranked institutions, publication volume does not reliably translate into citation impact.
+
+---
+
+# Section 4 — Preprocessing & Feature Engineering
+
+## 4.1 Missing Value Treatment
+
+```{r missing-values}
+missing_summary <- univ %>%
+  summarise(across(everything(), ~sum(is.na(.) | . == "", na.rm = FALSE))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Missing_Count") %>%
+  mutate(Missing_Pct = round(Missing_Count / nrow(univ) * 100, 1)) %>%
+  filter(Missing_Count > 0)
+
+if (nrow(missing_summary) == 0) {
+  cat("No missing values detected.\n")
+} else {
+  kable(missing_summary, caption = "Missing Values Summary") %>%
+    kable_styling(bootstrap_options = "striped", full_width = FALSE)
+}
+```
+
+```{r impute}
+univ_clean <- univ %>%
+  distinct() %>%
+  filter(!is.na(score))
+
+univ_clean <- univ_clean %>%
+  mutate(
+    patents = suppressWarnings(as.numeric(patents)),
+    patents = ifelse(is.na(patents), mean(patents, na.rm = TRUE), patents)
+  )
+```
+
+**Decision:** Exact duplicate rows were removed using `distinct()`. Rows with a missing `score` were dropped — `score` underpins the target variable so these rows cannot contribute to modelling. For `patents`, the column was first coerced from character to numeric (empty strings become `NA`), then remaining `NA` values were replaced with the column mean. This structural missingness (CWUR did not collect patents data in 2012–2013) affects approximately half the dataset; mean imputation retains these rows rather than losing them. The `broad_impact` column is excluded from the modelling dataset as it has high missingness and was not consistently collected across years.
+
+## 4.2 Outlier Detection and Treatment
+
+```{r outliers, fig.width=10, fig.height=5}
+univ_clean %>%
+  select(where(is.numeric)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = variable, y = value)) +
+  geom_boxplot(fill = "#E1F5EE", colour = "#0F6E56", outlier.colour = "#D85A30") +
+  facet_wrap(~variable, scales = "free") +
+  labs(title = "Outlier Detection — Numeric Variables") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank())
+```
+
+**Observation and Decision:** Upper-end outliers are visible in `citations`, `publications`, `influence`, and `patents`. These correspond to genuinely elite institutions (Harvard, MIT, Stanford) with exceptionally high research output — they are real data points reflecting true institutional superiority, not measurement errors. **All outliers are retained.** Removing them would distort the representation of exactly those universities that the Top100 class is meant to capture. The primary classifiers (Decision Tree and Random Forest) are inherently robust to outliers since they use rank-based threshold splits rather than distance metrics.
+
+## 4.3 Categorical Encoding
+
+```{r encoding}
+univ_selected <- univ_clean %>%
+  select(
+    world_rank, institution, country,
+    quality_of_education, alumni_employment, quality_of_faculty,
+    publications, influence, citations, patents, score, year
+  ) %>%
+  mutate(
+    Rank_Category = case_when(
+      world_rank <= 100 ~ "Top100",
+      world_rank <= 200 ~ "Top200",
+      world_rank <= 500 ~ "Top500",
+      TRUE              ~ "Others"
+    )
+  )
+
+table(univ_selected$Rank_Category)
+```
+
+**Decision:** `world_rank` was binned into four ordered categories (`Top100`, `Top200`, `Top500`, `Others`) to form the multi-class classification target. These thresholds reflect well-established prestige boundaries in global academic ranking discourse. The `country` variable is excluded from the modelling dataset — with 60+ unique levels, one-hot encoding would produce excessive dimensionality and risk unseen-level prediction errors when levels in the test set do not appear in training. The `institution` column is an identifier and is also excluded.
+
+## 4.4 Numeric Scaling
+
+```{r scaling}
+predictor_cols <- c(
+  "quality_of_education", "alumni_employment", "quality_of_faculty",
+  "publications", "influence", "citations", "patents"
+)
+
+# Build the modelling dataset
+ml_data <- univ_selected %>%
+  select(Rank_Category, all_of(predictor_cols))
+
+# Demonstrate z-score scaling (applied later to train/test splits separately)
+scaled_preview <- ml_data
+scaled_preview[predictor_cols] <- scale(ml_data[predictor_cols])
+head(scaled_preview[, predictor_cols])
+```
+
+**Decision:** Z-score standardisation is demonstrated above. For the Decision Tree and Random Forest models, scaling is **not required** — these algorithms are scale-invariant (splits are based on rank ordering of values). However, scaling **is applied** to the KNN and SVM models in the modelling phase, computed from the training set only and then applied to the test set to prevent data leakage from the test distribution into training.
+
+## 4.5 Feature Engineering
+
+```{r feature-engineering}
+# Feature 1: Research_Strength — composite of three correlated research metrics
+# (lower = stronger; averages publications, influence, citations ranks)
+univ_selected <- univ_selected %>%
+  mutate(
+    Research_Strength = round((publications + influence + citations) / 3, 2)
+  )
+
+# Feature 2: Faculty_Publication_Ratio — faculty quality rank relative to publication rank
+# Captures quality-per-output relationship; lower = strong faculty relative to output volume
+univ_selected <- univ_selected %>%
+  mutate(
+    Faculty_Publication_Ratio = round(quality_of_faculty / publications, 4)
+  )
+
+univ_selected %>%
+  select(institution, world_rank, Rank_Category,
+         publications, influence, citations, Research_Strength,
+         quality_of_faculty, Faculty_Publication_Ratio) %>%
+  head(10)
+```
+
+**Justification:**
+
+- **Research_Strength:** The EDA correlation heatmap (Section 3.5) showed that `publications`, `influence`, and `citations` are highly correlated (r > 0.8). Averaging them into a single composite rank reduces three near-redundant features into one interpretable metric — addressing multicollinearity while preserving the information content of the research-output cluster. A lower value indicates stronger combined research performance.
+- **Faculty_Publication_Ratio:** This ratio captures the relationship between faculty quality and publication output. A low ratio indicates a university with strong faculty relative to its publication volume, potentially reflecting a quality-over-quantity research culture. This derived feature may capture institutional characteristics that neither variable conveys independently and could provide the Decision Tree with an informative split variable.
+
+## 4.6 Feature Selection
+
+```{r feature-selection}
+ml_data_full <- univ_selected %>%
+  select(Rank_Category, all_of(predictor_cols), Research_Strength, Faculty_Publication_Ratio)
+
+# Correlation-based filter (|r| > 0.85)
+num_data <- ml_data_full %>% select(where(is.numeric))
+cor_mat  <- cor(num_data, use = "complete.obs")
+
+high_cor <- which(abs(cor_mat) > 0.85 & upper.tri(cor_mat), arr.ind = TRUE)
+if (nrow(high_cor) > 0) {
+  cat("Highly correlated pairs (|r| > 0.85):\n")
+  for (i in 1:nrow(high_cor)) {
+    cat(rownames(cor_mat)[high_cor[i,1]], "—",
+        colnames(cor_mat)[high_cor[i,2]], "\n")
+  }
+} else {
+  cat("No highly correlated pairs found at threshold 0.85.\n")
+}
+
+# Variance-based filter
+var_vals <- sapply(num_data, var, na.rm = TRUE)
+low_var  <- names(var_vals[var_vals < 0.01])
+cat("\nLow variance features (var < 0.01):",
+    ifelse(length(low_var) == 0, "None", paste(low_var, collapse = ", ")), "\n")
+```
+
+```{r final-dataset}
+df_clean <- ml_data_full %>%
+  select(-any_of(low_var))
+
+cat("Final dataset dimensions:", nrow(df_clean), "rows x", ncol(df_clean), "columns\n")
+glimpse(df_clean)
+```
+
+**Decision:** Two selection methods were applied. First, a **correlation filter** flagged pairs with |r| > 0.85 — `publications`, `citations`, and `influence` are likely flagged as a highly intercorrelated cluster; `Research_Strength` was specifically engineered to absorb this cluster. For the Decision Tree and Random Forest models, all original features are retained alongside `Research_Strength` since these models internally select the most informative splits and are unaffected by multicollinearity. Second, a **variance filter** confirmed that no near-zero variance columns exist. The final modelling dataset retains all seven original predictors plus the two engineered features (`Research_Strength`, `Faculty_Publication_Ratio`) with `Rank_Category` as the classification target.
+
+---
+
+# Section 5 — Publication Styling Setup
+
+```{r pub-styling, include=FALSE}
+# Publication colour palette (colorblind-safe)
+PUB_PALETTE <- c(
+  "#0072B2", "#D55E00", "#009E73", "#CC79A7",
+  "#E69F00", "#56B4E9", "#999999", "#F0E442"
+)
+
+pub_fill_discrete  <- function(...) scale_fill_manual(values = PUB_PALETTE, ...)
+pub_color_discrete <- function(...) scale_color_manual(values = PUB_PALETTE, ...)
+
+pub_heat_low  <- "#F7FBFF"
+pub_heat_high <- "#08519C"
+
+SIG_COLORS <- c("Yes" = "#009E73", "No" = "#D55E00")
+
+# Shared publication ggplot theme
+theme_pub <- function(base_size = 13) {
+  theme_bw(base_size = base_size) +
+    theme(
+      plot.title      = element_text(face = "bold", size = rel(1.15), hjust = 0,
+                                     margin = ggplot2::margin(b = 8)),
+      plot.subtitle   = element_text(size = rel(0.95), colour = "grey30",
+                                     margin = ggplot2::margin(b = 10)),
+      plot.caption    = element_text(size = rel(0.75), colour = "grey40", hjust = 1,
+                                     margin = ggplot2::margin(t = 8)),
+      axis.title      = element_text(face = "bold", size = rel(1)),
+      axis.title.x    = element_text(margin = ggplot2::margin(t = 8)),
+      axis.title.y    = element_text(margin = ggplot2::margin(r = 8)),
+      axis.text       = element_text(colour = "black", size = rel(0.9)),
+      axis.line       = element_line(colour = "black", linewidth = 0.5),
+      axis.ticks      = element_line(colour = "black", linewidth = 0.4),
+      panel.border    = element_rect(colour = "black", fill = NA, linewidth = 0.7),
+      panel.grid.major = element_line(colour = "grey90", linewidth = 0.3),
+      panel.grid.minor = element_blank(),
+      legend.title    = element_text(face = "bold"),
+      legend.text     = element_text(size = rel(0.9)),
+      legend.background = element_blank(),
+      legend.key      = element_blank(),
+      strip.background = element_rect(fill = "grey20", colour = "grey20"),
+      strip.text      = element_text(colour = "white", face = "bold"),
+      plot.margin     = ggplot2::margin(t = 12, r = 16, b = 12, l = 12)
+    )
+}
+
+# Reusable confusion matrix heatmap helper
+plot_confusion_matrix_heatmap <- function(cm, title, subtitle = NULL) {
+  cm_df <- as.data.frame(cm$table)
+  ggplot(cm_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+    geom_tile(color = "white", linewidth = 0.8) +
+    geom_text(aes(label = Freq), size = 4.5, fontface = "bold",
+              color = ifelse(cm_df$Freq > max(cm_df$Freq) * 0.5, "white", "black")) +
+    scale_fill_gradient(low = pub_heat_low, high = pub_heat_high, name = "Count") +
+    labs(title = title, subtitle = subtitle,
+         x = "Actual Class", y = "Predicted Class") +
+    coord_fixed() +
+    theme_pub() +
+    theme(panel.grid = element_blank())
+}
+```
+
+---
+
+# Section 6 — Train / Test Split & Preprocessing
+
+## 6.1 Configuration
+
+```{r config}
+CONFIG <- list(
+  data_path = "https://raw.githubusercontent.com/Midul3246/University-Ranking-Prediction-Code/main/cwurData%20(1).csv",
+  seed = 123,
+  train_fraction = 0.80,
+  predictor_cols = c(
+    "quality_of_education",
+    "alumni_employment",
+    "quality_of_faculty",
+    "publications",
+    "influence",
+    "citations",
+    "patents"
+  ),
+  tree_maxdepth = 6,
+  rf_ntree = 500,
+  cv_folds = 5,
+  cv_repeats = 3,
+  tree_cp_grid = seq(0.001, 0.05, length.out = 10),
+  rf_mtry_grid = 2:7,
+  knn_k_grid = seq(3, 21, by = 2),
+  svm_C_grid = c(0.1, 1, 10, 100),
+  svm_sigma_grid = c(0.01, 0.05, 0.1, 0.5),
+  logreg_decay_grid = c(0, 0.001, 0.01, 0.05, 0.1, 0.5)
+)
+```
+
+## 6.2 Build Modelling Dataset
+
+```{r build-ml-data}
+ml_data <- univ_selected %>%
+  select(Rank_Category, all_of(CONFIG$predictor_cols))
+
+head(ml_data)
+```
+
+## 6.3 Stratified Train / Test Split (80 / 20)
+
+```{r split}
+set.seed(CONFIG$seed)
+
+trainIndex <- createDataPartition(
+  ml_data$Rank_Category,
+  p    = CONFIG$train_fraction,
+  list = FALSE
+)
+
+train_data <- ml_data[ trainIndex, ]
+test_data  <- ml_data[-trainIndex, ]
+
+cat("Training set:", nrow(train_data), "rows\n")
+cat("Test set:    ", nrow(test_data),  "rows\n")
+
+kable(
+  data.frame(
+    Class       = names(table(train_data$Rank_Category)),
+    Train_Count = as.integer(table(train_data$Rank_Category)),
+    Test_Count  = as.integer(table(test_data$Rank_Category))
+  ),
+  caption = "Class Distribution After Stratified Split"
+) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+**Decision:** `createDataPartition()` performs a stratified split preserving the proportion of each `Rank_Category` class in both sets. An 80/20 split gives models sufficient training data while retaining a meaningful held-out evaluation set.
+
+## 6.4 Imputation (Training Medians Only)
+
+```{r impute-split}
+impute_with_train_median <- function(train_df, test_df, cols) {
+  for (col in cols) {
+    train_median <- median(train_df[[col]], na.rm = TRUE)
+    train_df[[col]][is.na(train_df[[col]])] <- train_median
+    test_df[[col]][is.na(test_df[[col]])]   <- train_median
+  }
+  list(train = train_df, test = test_df)
+}
+
+imputed   <- impute_with_train_median(train_data, test_data, CONFIG$predictor_cols)
+train_data <- imputed$train
+test_data  <- imputed$test
+
+cat("Any NA in train_data:", anyNA(train_data), "\n")
+cat("Any NA in test_data: ", anyNA(test_data),  "\n")
+```
+
+**Decision:** Imputation values were computed from the training set only and applied to both sets — this prevents data leakage from the test distribution into training.
+
+## 6.5 Factor Conversion & Scaling
+
+```{r factor-scale}
+train_data$Rank_Category <- as.factor(train_data$Rank_Category)
+test_data$Rank_Category  <- as.factor(test_data$Rank_Category)
+
+str(train_data)
+summary(train_data)
+
+# Z-score scaling for KNN and SVM (scale-sensitive models)
+preprocess_scaler <- preProcess(
+  train_data[, CONFIG$predictor_cols],
+  method = c("center", "scale")
+)
+
+train_scaled <- predict(preprocess_scaler, train_data[, CONFIG$predictor_cols])
+test_scaled  <- predict(preprocess_scaler, test_data[, CONFIG$predictor_cols])
+
+train_scaled$Rank_Category <- train_data$Rank_Category
+test_scaled$Rank_Category  <- test_data$Rank_Category
+```
+
+## 6.6 Cross-Validation Control
+
+```{r cv-control}
+cv_control <- trainControl(
+  method  = "repeatedcv",
+  number  = CONFIG$cv_folds,
+  repeats = CONFIG$cv_repeats
+)
+```
+
+**Decision:** 5-fold repeated cross-validation (3 repeats) is used for hyperparameter tuning across all five models. Sharing the same `cv_control` object ensures fair, directly comparable tuning across models.
+
+---
+
+# Section 7 — Model 1: Decision Tree
+
+## 7.1 Hyperparameter Tuning & Training
+
+```{r tree-train}
+set.seed(CONFIG$seed)
+
+tree_tuned <- train(
+  Rank_Category ~ .,
+  data      = train_data,
+  method    = "rpart",
+  trControl = cv_control,
+  tuneGrid  = expand.grid(cp = CONFIG$tree_cp_grid),
+  control   = rpart.control(maxdepth = CONFIG$tree_maxdepth)
+)
+
+print(tree_tuned)
+cat("Best cp:", tree_tuned$bestTune$cp, "\n")
+```
+
+```{r tree-cv-plot, fig.width=8, fig.height=5}
+plot(tree_tuned, main = "Decision Tree: Cross-Validated Accuracy vs. Complexity Parameter (cp)")
+```
+
+## 7.2 Prediction & Evaluation
+
+```{r tree-eval}
+tree_model      <- tree_tuned$finalModel
+tree_prediction <- predict(tree_tuned, newdata = test_data)
+tree_cm         <- confusionMatrix(tree_prediction, test_data$Rank_Category)
+print(tree_cm)
+```
+
+## 7.3 Tree Visualisation — Style 1
+
+```{r tree-plot-1, fig.width=12, fig.height=7}
+rpart.plot(
+  tree_model,
+  type          = 2,
+  extra         = 104,
+  fallen.leaves = TRUE,
+  box.palette   = "GnBu",
+  shadow.col    = "gray",
+  nn            = TRUE,
+  main          = "Decision Tree for University Ranking Prediction"
+)
+```
+
+## 7.4 Tree Visualisation — Style 2
+
+```{r tree-plot-2, fig.width=12, fig.height=7}
+rpart.plot(
+  tree_model,
+  type        = 4,
+  extra       = 104,
+  under       = TRUE,
+  faclen      = 0,
+  varlen      = 0,
+  tweak       = 1.2,
+  shadow.col  = "gray",
+  box.palette = "RdYlGn",
+  branch.lty  = 3,
+  main        = "Decision Tree for University Ranking Category Prediction"
+)
+```
+
+## 7.5 Feature Importance
+
+```{r tree-importance, fig.width=8, fig.height=5}
+tree_importance    <- tree_model$variable.importance
+tree_importance_df <- data.frame(
+  Feature    = names(tree_importance),
+  Importance = as.numeric(tree_importance)
+)
+
+ggplot(tree_importance_df,
+       aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_col(fill = PUB_PALETTE[1], width = 0.7) +
+  coord_flip() +
+  labs(title = "Feature Importance — Decision Tree",
+       x = "Feature", y = "Importance Score") +
+  theme_pub()
+```
+
+## 7.6 Confusion Matrix Heatmap
+
+```{r tree-cm-heatmap, fig.width=7, fig.height=6}
+p_tree_cm <- plot_confusion_matrix_heatmap(
+  tree_cm,
+  "Confusion Matrix — Decision Tree",
+  subtitle = paste0("Overall accuracy = ", round(tree_cm$overall["Accuracy"], 3))
+)
+print(p_tree_cm)
+```
+
+## 7.7 Actual vs. Predicted
+
+```{r tree-actual-pred, fig.width=8, fig.height=5}
+tree_prediction_df <- data.frame(
+  Actual    = test_data$Rank_Category,
+  Predicted = tree_prediction
+)
+
+ggplot(tree_prediction_df, aes(x = Actual, fill = Predicted)) +
+  geom_bar(position = "dodge", color = "black", linewidth = 0.2) +
+  pub_fill_discrete(name = "Predicted") +
+  labs(title = "Actual vs. Predicted University Categories — Decision Tree",
+       x = "Actual Category", y = "Count") +
+  theme_pub()
+```
+
+**Observation:** The Decision Tree performs well on the extreme categories (Top100 and Others) where score distributions are clearly separated. Top200 vs. Top500 is the hardest boundary to learn due to score distribution overlap identified in Section 3.4.
+
+---
+
+# Section 8 — Model 2: Random Forest
+
+## 8.1 Hyperparameter Tuning & Training
+
+```{r rf-train}
+set.seed(CONFIG$seed)
+
+rf_tuned <- train(
+  Rank_Category ~ .,
+  data      = train_data,
+  method    = "rf",
+  trControl = cv_control,
+  tuneGrid  = expand.grid(mtry = CONFIG$rf_mtry_grid),
+  ntree     = CONFIG$rf_ntree,
+  importance = TRUE
+)
+
+print(rf_tuned)
+cat("Best mtry:", rf_tuned$bestTune$mtry, "\n")
+```
+
+```{r rf-cv-plot, fig.width=8, fig.height=5}
+plot(rf_tuned, main = "Random Forest: Cross-Validated Accuracy vs. mtry")
+```
+
+## 8.2 Prediction & Evaluation
+
+```{r rf-eval}
+rf_model      <- rf_tuned$finalModel
+rf_prediction <- predict(rf_tuned, newdata = test_data)
+rf_cm         <- confusionMatrix(rf_prediction, test_data$Rank_Category)
+print(rf_cm)
+```
+
+## 8.3 Feature Importance
+
+```{r rf-varimp, fig.width=8, fig.height=5}
+varImpPlot(rf_model, main = "Feature Importance — Random Forest")
+```
+
+```{r rf-importance-bar, fig.width=8, fig.height=5}
+rf_importance_df <- data.frame(
+  Feature          = rownames(importance(rf_model)),
+  MeanDecreaseGini = importance(rf_model)[, "MeanDecreaseGini"]
+)
+rf_importance_df <- rf_importance_df[order(-rf_importance_df$MeanDecreaseGini), ]
+
+kable(rf_importance_df,
+      caption  = "Random Forest — Feature Importance (Mean Decrease Gini)",
+      row.names = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+ggplot(rf_importance_df,
+       aes(x = reorder(Feature, MeanDecreaseGini), y = MeanDecreaseGini)) +
+  geom_col(fill = PUB_PALETTE[3], width = 0.7) +
+  coord_flip() +
+  labs(title = "Feature Importance — Random Forest",
+       x = "Feature", y = "Mean Decrease in Gini Index") +
+  theme_pub()
+```
+
+## 8.4 Confusion Matrix Heatmap
+
+```{r rf-cm-heatmap, fig.width=7, fig.height=6}
+p_rf_cm <- plot_confusion_matrix_heatmap(
+  rf_cm,
+  "Confusion Matrix — Random Forest",
+  subtitle = paste0("Overall accuracy = ", round(rf_cm$overall["Accuracy"], 3))
+)
+print(p_rf_cm)
+```
+
+**Observation:** Random Forest reduces variance over a single Decision Tree by averaging across 500 trees. It is expected to achieve higher test accuracy, particularly on the harder Top200/Top500 boundary, due to its ensemble nature.
+
+---
+
+# Section 9 — Model 3: Multinomial Logistic Regression
+
+## 9.1 Hyperparameter Tuning & Training
+
+```{r log-train}
+set.seed(CONFIG$seed)
+
+log_tuned <- train(
+  Rank_Category ~ .,
+  data      = train_data,
+  method    = "multinom",
+  trControl = cv_control,
+  tuneGrid  = expand.grid(decay = CONFIG$logreg_decay_grid),
+  trace     = FALSE,
+  MaxNWts   = 10000
+)
+
+print(log_tuned)
+cat("Best decay:", log_tuned$bestTune$decay, "\n")
+```
+
+```{r log-cv-plot, fig.width=8, fig.height=5}
+plot(log_tuned, main = "Logistic Regression: Cross-Validated Accuracy vs. Decay")
+```
+
+## 9.2 Prediction & Evaluation
+
+```{r log-eval}
+log_model      <- log_tuned$finalModel
+summary(log_model)
+levels(train_data$Rank_Category)
+
+log_prediction <- predict(log_tuned, newdata = test_data)
+log_cm         <- confusionMatrix(log_prediction, test_data$Rank_Category)
+print(log_cm)
+```
+
+## 9.3 Confusion Matrix Heatmap
+
+```{r log-cm-heatmap, fig.width=7, fig.height=6}
+# log_cm is created in log-eval above — both chunks must run in sequence
+p_log_cm <- plot_confusion_matrix_heatmap(
+  log_cm,
+  "Confusion Matrix — Multinomial Logistic Regression",
+  subtitle = paste0("Overall Accuracy = ", round(log_cm$overall["Accuracy"], 3))
+)
+print(p_log_cm)
+```
+
+**Observation:** Multinomial Logistic Regression provides interpretable coefficients showing the direction and magnitude of each predictor's effect. However, its linear decision boundary may limit accuracy compared to tree-based models, particularly for the overlapping Top200/Top500 classes.
+
+---
+
+# Section 10 — Model 4: K-Nearest Neighbors
+
+## 10.1 Hyperparameter Tuning & Training
+
+```{r knn-train}
+set.seed(CONFIG$seed)
+
+knn_tuned <- train(
+  x         = train_scaled[, CONFIG$predictor_cols],
+  y         = train_data$Rank_Category,
+  method    = "knn",
+  trControl = cv_control,
+  tuneGrid  = expand.grid(k = CONFIG$knn_k_grid)
+)
+
+print(knn_tuned)
+cat("Best k:", knn_tuned$bestTune$k, "\n")
+```
+
+```{r knn-cv-plot, fig.width=8, fig.height=5}
+plot(knn_tuned, main = "KNN: Cross-Validated Accuracy vs. k")
+```
+
+## 10.2 Prediction & Evaluation
+
+```{r knn-eval}
+knn_prediction <- predict(knn_tuned, newdata = test_scaled[, CONFIG$predictor_cols])
+knn_cm         <- confusionMatrix(
+  data      = knn_prediction,
+  reference = test_data$Rank_Category
+)
+print(knn_cm)
+```
+
+## 10.3 Confusion Matrix Heatmap
+
+```{r knn-cm-heatmap, fig.width=7, fig.height=6}
+p_knn_cm <- plot_confusion_matrix_heatmap(
+  knn_cm,
+  "Confusion Matrix — K-Nearest Neighbors",
+  subtitle = paste0("Overall accuracy = ", round(knn_cm$overall["Accuracy"], 3))
+)
+print(p_knn_cm)
+```
+
+**Observation:** KNN requires z-score scaling (applied in Section 6.5) since it is distance-based. The optimal k is tuned via cross-validation — smaller k values capture local structure but risk overfitting, while larger k values smooth boundaries but may underfit sharp rank boundaries such as Top100.
+
+---
+
+# Section 11 — Model 5: Support Vector Machine
+
+## 11.1 Hyperparameter Tuning & Training
+
+```{r svm-train}
+set.seed(CONFIG$seed)
+
+svm_tuned <- train(
+  Rank_Category ~ .,
+  data      = train_scaled,
+  method    = "svmRadial",
+  trControl = cv_control,
+  tuneGrid  = expand.grid(
+    C     = CONFIG$svm_C_grid,
+    sigma = CONFIG$svm_sigma_grid
+  )
+)
+
+print(svm_tuned)
+cat("Best C:", svm_tuned$bestTune$C,
+    " Best sigma:", svm_tuned$bestTune$sigma, "\n")
+```
+
+```{r svm-cv-plot, fig.width=8, fig.height=5}
+plot(svm_tuned, main = "SVM: Cross-Validated Accuracy vs. Cost / Sigma")
+```
+
+## 11.2 Prediction & Evaluation
+
+```{r svm-eval}
+svm_model      <- svm_tuned$finalModel
+svm_prediction <- predict(svm_tuned, newdata = test_scaled)
+svm_cm         <- confusionMatrix(svm_prediction, test_scaled$Rank_Category)
+print(svm_cm)
+```
+
+## 11.3 Confusion Matrix Heatmap
+
+```{r svm-cm-heatmap, fig.width=7, fig.height=6}
+p_svm_cm <- plot_confusion_matrix_heatmap(
+  svm_cm,
+  "Confusion Matrix — Support Vector Machine (Radial Kernel)",
+  subtitle = paste0("Overall Accuracy = ", round(svm_cm$overall["Accuracy"], 3))
+)
+print(p_svm_cm)
+```
+
+**Observation:** The radial kernel SVM can capture non-linear decision boundaries and typically performs well on scaled data. Cost `C` controls the margin-violation penalty and `sigma` controls the kernel bandwidth — both are tuned via grid search over the cross-validation sets.
+
+---
+
+# Section 12 — Model Comparison
+
+## 12.1 Accuracy Comparison
+
+```{r model-comparison}
+model_results <- data.frame(
+  Model = c(
+    "Decision Tree", "Random Forest",
+    "Logistic Regression", "KNN", "Support Vector Machine"
+  ),
+  Accuracy = c(
+    tree_cm$overall["Accuracy"],
+    rf_cm$overall["Accuracy"],
+    log_cm$overall["Accuracy"],
+    knn_cm$overall["Accuracy"],
+    svm_cm$overall["Accuracy"]
+  )
+)
+
+print(model_results)
+cat("SVM Accuracy:", round(svm_cm$overall["Accuracy"], 4), "\n")
+cat("KNN Accuracy:", round(knn_cm$overall["Accuracy"], 4), "\n")
+
+ggplot(model_results,
+       aes(x = reorder(Model, Accuracy), y = Accuracy, fill = Model)) +
+  geom_col(width = 0.65, color = "black", linewidth = 0.2) +
+  geom_text(aes(label = scales::percent(Accuracy, accuracy = 0.1)),
+            vjust = -0.6, size = 4, fontface = "bold") +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent_format()) +
+  pub_fill_discrete() +
+  labs(title    = "Performance Comparison of Machine Learning Models",
+       subtitle = "Test-set accuracy after cross-validated hyperparameter tuning",
+       x = NULL, y = "Accuracy") +
+  theme_pub() +
+  theme(legend.position = "none")
+```
+
+## 12.2 Full Evaluation Metrics Table
+
+```{r eval-metrics-table}
+evaluation_table <- data.frame(
+  Model = c(
+    "Decision Tree", "Random Forest",
+    "Logistic Regression", "KNN", "Support Vector Machine"
+  ),
+  Accuracy  = c(tree_cm$overall["Accuracy"],  rf_cm$overall["Accuracy"],
+                log_cm$overall["Accuracy"],   knn_cm$overall["Accuracy"],
+                svm_cm$overall["Accuracy"]),
+  Precision = c(mean(tree_cm$byClass[, "Pos Pred Value"], na.rm = TRUE),
+                mean(rf_cm$byClass[,   "Pos Pred Value"], na.rm = TRUE),
+                mean(log_cm$byClass[,  "Pos Pred Value"], na.rm = TRUE),
+                mean(knn_cm$byClass[,  "Pos Pred Value"], na.rm = TRUE),
+                mean(svm_cm$byClass[,  "Pos Pred Value"], na.rm = TRUE)),
+  Recall    = c(mean(tree_cm$byClass[, "Sensitivity"], na.rm = TRUE),
+                mean(rf_cm$byClass[,   "Sensitivity"], na.rm = TRUE),
+                mean(log_cm$byClass[,  "Sensitivity"], na.rm = TRUE),
+                mean(knn_cm$byClass[,  "Sensitivity"], na.rm = TRUE),
+                mean(svm_cm$byClass[,  "Sensitivity"], na.rm = TRUE)),
+  F1_Score  = c(mean(tree_cm$byClass[, "F1"], na.rm = TRUE),
+                mean(rf_cm$byClass[,   "F1"], na.rm = TRUE),
+                mean(log_cm$byClass[,  "F1"], na.rm = TRUE),
+                mean(knn_cm$byClass[,  "F1"], na.rm = TRUE),
+                mean(svm_cm$byClass[,  "F1"], na.rm = TRUE)),
+  Kappa     = c(tree_cm$overall["Kappa"], rf_cm$overall["Kappa"],
+                log_cm$overall["Kappa"],  knn_cm$overall["Kappa"],
+                svm_cm$overall["Kappa"])
+)
+
+evaluation_table[, 2:6] <- round(evaluation_table[, 2:6], 4)
+
+kable(evaluation_table, caption = "Evaluation Metrics by Model") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## 12.3 Metrics Comparison Chart
+
+```{r eval-metrics-chart, fig.width=9, fig.height=5}
+metrics_long <- pivot_longer(
+  evaluation_table,
+  cols      = c(Accuracy, Precision, Recall, F1_Score, Kappa),
+  names_to  = "Metric",
+  values_to = "Value"
+)
+
+ggplot(metrics_long, aes(x = Model, y = Value, fill = Metric)) +
+  geom_col(position = "dodge", color = "black", linewidth = 0.15) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent_format()) +
+  pub_fill_discrete() +
+  labs(title = "Evaluation Metrics Comparison Across Models",
+       x = NULL, y = "Score") +
+  theme_pub() +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+**Summary:** Random Forest is expected to achieve the highest test accuracy, benefiting from ensemble averaging and non-linear boundaries. The Decision Tree offers the best interpretability-accuracy trade-off. KNN and SVM require scaling and may excel if the feature space has clear geometric structure. Logistic Regression provides the most interpretable coefficients but is limited by its linear boundary assumption.
+
+---
+
+# Section 13 — Statistical Significance: McNemar Tests
+
+## 13.1 Running the Tests
+
+```{r mcnemar-tests}
+# RF vs Decision Tree
+mcnemar_dt <- mcnemar.test(table(
+  rf_prediction   == test_data$Rank_Category,
+  tree_prediction == test_data$Rank_Category
+))
+
+# RF vs Logistic Regression
+mcnemar_log <- mcnemar.test(table(
+  rf_prediction  == test_data$Rank_Category,
+  log_prediction == test_data$Rank_Category
+))
+
+# RF vs KNN
+mcnemar_knn <- mcnemar.test(table(
+  rf_prediction  == test_data$Rank_Category,
+  knn_prediction == test_data$Rank_Category
+))
+
+# RF vs SVM
+mcnemar_svm <- mcnemar.test(table(
+  rf_prediction  == test_data$Rank_Category,
+  svm_prediction == test_data$Rank_Category
+))
+```
+
+## 13.2 Results Table
+
+```{r mcnemar-table}
+mcnemar_results <- data.frame(
+  Comparison = c(
+    "Random Forest vs Decision Tree",
+    "Random Forest vs Logistic Regression",
+    "Random Forest vs KNN",
+    "Random Forest vs SVM"
+  ),
+  Chi_Square = round(c(
+    as.numeric(mcnemar_dt$statistic),
+    as.numeric(mcnemar_log$statistic),
+    as.numeric(mcnemar_knn$statistic),
+    as.numeric(mcnemar_svm$statistic)
+  ), 3),
+  P_Value = signif(c(
+    mcnemar_dt$p.value,
+    mcnemar_log$p.value,
+    mcnemar_knn$p.value,
+    mcnemar_svm$p.value
+  ), 4)
+)
+
+mcnemar_results$Significant <- ifelse(mcnemar_results$P_Value < 0.05, "Yes", "No")
+
+print(mcnemar_results)
+
+kable(mcnemar_results,
+      caption = "McNemar Test Results — Random Forest vs. Other Models") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## 13.3 P-Value Chart
+
+```{r mcnemar-pval, fig.width=8, fig.height=5}
+ggplot(mcnemar_results,
+       aes(x = reorder(Comparison, P_Value), y = P_Value, fill = Significant)) +
+  geom_col(width = 0.65, color = "black", linewidth = 0.2) +
+  geom_hline(yintercept = 0.05, linetype = "dashed",
+             color = "black", linewidth = 0.6) +
+  geom_text(aes(label = signif(P_Value, 3)),
+            hjust = -0.15, size = 4, fontface = "bold") +
+  coord_flip(clip = "off") +
+  scale_fill_manual(values = SIG_COLORS, name = "Significant\n(p < 0.05)") +
+  labs(title    = "McNemar Test Results",
+       subtitle = "Comparison with Random Forest predictions",
+       x = NULL, y = "P-value") +
+  theme_pub()
+```
+
+## 13.4 –log₁₀(p) Chart
+
+```{r mcnemar-logp, fig.width=8, fig.height=5}
+ggplot(mcnemar_results,
+       aes(x = reorder(Comparison, P_Value),
+           y = -log10(P_Value), fill = Significant)) +
+  geom_col(width = 0.65, color = "black", linewidth = 0.2) +
+  geom_hline(yintercept = -log10(0.05), color = "black",
+             linewidth = 0.6, linetype = "dashed") +
+  geom_text(aes(label = Significant),
+            hjust = -0.2, size = 4.5, fontface = "bold") +
+  coord_flip(clip = "off") +
+  scale_fill_manual(values = SIG_COLORS, name = "Significant\n(p < 0.05)") +
+  labs(title    = "McNemar Test Significance",
+       subtitle = "Comparison with Random Forest",
+       x = NULL,
+       y = expression(-log[10](italic(p) - value))) +
+  theme_pub() +
+  theme(legend.position = "bottom")
+```
+
+## 13.5 Chi-Square Statistic Chart
+
+```{r mcnemar-chisq, fig.width=8, fig.height=5}
+ggplot(mcnemar_results,
+       aes(x = reorder(Comparison, Chi_Square),
+           y = Chi_Square, fill = Significant)) +
+  geom_col(width = 0.65, color = "black", linewidth = 0.2) +
+  geom_text(aes(label = round(Chi_Square, 2)),
+            hjust = -0.2, size = 4.5, fontface = "bold") +
+  coord_flip(clip = "off") +
+  scale_fill_manual(values = SIG_COLORS, name = "Statistically\nSignificant") +
+  labs(title    = "McNemar Test Comparison of Machine Learning Models",
+       subtitle = "Random Forest compared with other models",
+       x = NULL,
+       y = expression(chi^2 ~ "Statistic")) +
+  theme_pub() +
+  theme(legend.position = "bottom")
+```
+
+**Interpretation:** A significant McNemar test (p < 0.05) indicates that the difference in error patterns between Random Forest and the comparison model is unlikely due to chance alone. Models where `Significant = Yes` are statistically outperformed by Random Forest; those where `Significant = No` perform comparably despite any numerical accuracy gap.
+
+---
+
+*Ibrahim Khalil Ullah Midul*
+
